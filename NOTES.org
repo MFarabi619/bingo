@@ -1,0 +1,13 @@
+#+title: Debugging the Debugger, Dedebugging?
+
+#+begin_quote
+Race condition causing server to act up weird when receiving a command
+like continue. Sometimes the target doesnt execute and we have to send
+the same command again, sometimes it executes, then skips the breakpoint
+like 3 times, and then hits it. Might be an icache problem.
+#+end_quote
+
+- [ ] write simple go program
+- [ ] inspect binary output
+- [ ] use debugger on go program
+- [ ] reproduce issue

@@ -9,4 +9,7 @@
 {
   languages.go.enable = true;
 
+  packages = with pkgs; [
+    just
+  ];
 }

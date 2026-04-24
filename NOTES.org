@@ -7,7 +7,55 @@ the same command again, sometimes it executes, then skips the breakpoint
 like 3 times, and then hits it. Might be an icache problem.
 #+end_quote
 
-- [ ] write simple go program
+- [X] learn about [[https://go.dev/tour/concurrency/1][goroutines]]
+- [X] write simple go program with goroutines
+
+#+NAME: bin
+#+BEGIN_SRC go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+func hotFunc(id int) {
+	fmt.Println("hit", id)
+}
+
+func main() {
+	var waitGroup sync.WaitGroup
+
+	for i := 0; i < 4; i++ {
+		waitGroup.Add(1)
+
+		go func(id int) {
+			defer waitGroup.Done()
+
+			for j := 0; j < 100; j++ {
+				hotFunc(id)
+			}
+		}(i)
+	}
+
+	waitGroup.Wait()
+}
+#+END_SRC
+
+#+BEGIN_SRC bash :noweb yes
+set -euo pipefail
+
+cat <<'EOF' > bin.go
+<<bin>>
+EOF
+
+go build -gcflags='-N -l' -o bin bin.go
+
+rm bin.go
+
+echo "built: $(file bin)"
+#+END_SRC
+
 - [ ] inspect binary output
 - [ ] use debugger on go program
 - [ ] reproduce issue

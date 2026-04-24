@@ -56,6 +56,18 @@ rm bin.go
 echo "built: $(file bin)"
 #+END_SRC
 
-- [ ] inspect binary output
-- [ ] use debugger on go program
-- [ ] reproduce issue
+- [X] inspect binary output
+
+#+BEGIN_SRC bash
+  go build -tags bingonative -o ./build/bingo/bingo_server ./cmd/bingo
+  codesign --sign - --entitlements entitlements.plist --force ./build/bingo/bingo_server
+#+END_SRC
+
+
+- [X] use debugger on go program
+
+go tool objdump ./build/bingo/bingo_server | grep -A 20 'SingleStep'
+
+go tool objdump ./build/bingo/bingo_server | sed -n '606979,608256p' | grep -n 'CALL.*debugger\|CALL.*bingo' | head -30
+
+- [X] reproduce issue

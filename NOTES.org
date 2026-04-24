@@ -7,67 +7,432 @@ the same command again, sometimes it executes, then skips the breakpoint
 like 3 times, and then hits it. Might be an icache problem.
 #+end_quote
 
-- [X] learn about [[https://go.dev/tour/concurrency/1][goroutines]]
-- [X] write simple go program with goroutines
+Two distinct failure modes:
+1. Command sent, nothing happens (must resend)
+2. Breakpoints silently skipped, then eventually hit
 
-#+NAME: bin
-#+BEGIN_SRC go
-package main
+These turned out to be *two separate bugs* at different layers.
 
-import (
-	"fmt"
-	"sync"
-)
+* Software breakpoints
 
-func hotFunc(id int) {
-	fmt.Println("hit", id)
+On every architecture, software breakpoints work the same way: overwrite
+an instruction with a trap, let the CPU execute it, handle the trap.
+
+On ARM64 the trap is =BRK #0= ([[https://developer.arm.com/documentation/ddi0487/latest/][ARMv8-A ARM, C6.2.29]]),
+encoded as 4 bytes:
+
+#+begin_src c
+/* little-endian encoding of 0xD4200000 */
+uint8_t brk[4] = {0x00, 0x00, 0x20, 0xD4};
+#+end_src
+
+Unlike x86 =INT3= (1 byte, PC advances past it), ARM64 =BRK= traps with
+PC pointing *at* the BRK instruction. No PC rewind needed.
+
+#+begin_example
+  x86 INT3 vs ARM64 BRK — PC after trap
+
+  x86:     ... | INT3 | next |        ARM64:  ... | BRK #0 | next |
+                        ^-- PC                      ^-- PC
+                  (past trap)                    (at trap)
+#+end_example
+
+The original code at the breakpoint address is saved, the trap is written
+in its place via [[https://developer.apple.com/documentation/kernel/mach_vm][=mach_vm_write=]]. When the CPU executes the trap, the
+debugger gets a =SIGTRAP= ([[https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/signal.h.html][POSIX signal.h]]).
+
+* Stepping over
+
+When a thread hits a breakpoint and the user says "continue", we can't
+just resume execution because the machine is sitting on our =BRK= instruction and
+the CPU would immediately trap again.
+
+We need to:
+
+1. Restore the original instruction bytes
+2. Execute that one instruction
+3. Reinstall the BRK trap
+4. Resume normal execution
+
+This is called a *breakpoint step-over*. It uses the [[https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/ptrace.2.html][ptrace(2)]] single-step
+facility (=PT_STEP= on Darwin) to execute exactly one instruction.
+
+#+begin_example
+     BREAKPOINT HIT                     STEP-OVER SEQUENCE
+     ===============                     ==================
+
+     Memory at 0x1000:                  1. Restore original bytes:
+     +----------+                          +----------+
+     | BRK #0   |  <-- PC                 | MOV X0,1 |  <-- PC
+     +----------+                          +----------+
+
+                                        2. Single-step (PT_STEP):
+                                           CPU executes MOV X0,1
+                                           PC advances to 0x1004
+
+                                        3. Reinstall trap:
+                                           +----------+
+                                           | BRK #0   |  (0x1000)
+                                           +----------+
+                                           | ...      |  <-- PC (0x1004)
+                                           +----------+
+
+                                        4. Continue (PT_CONTINUE)
+#+end_example
+
+** Bug A: the multi-thread step-over window
+
+*** Darwin's PT_STEP is process-wide
+
+This is the critical difference from Linux. On Linux, =ptrace(PTRACE_SINGLESTEP, tid)=
+steps a *specific thread*. All other threads remain stopped. On Darwin:
+
+#+begin_src c
+/* backend_darwin_arm64.go: SingleStep */
+ptrace(PT_STEP, b.pid, 1, 0);  /* <-- pid, not tid! */
+#+end_src
+
+Darwin's =PT_STEP= takes a *PID*, not a thread port. It resumes the
+*entire process* and stops on the next instruction of *whichever thread
+runs first*. The =tid= argument is saved for later (to read the right
+thread's registers when the trap fires), but ptrace doesn't use it.
+
+| Platform | Single-step scope | API                                  |
+|----------+-------------------+--------------------------------------|
+| Linux    | per-thread        | =ptrace(PTRACE_SINGLESTEP, tid)=     |
+| Darwin   | process-wide      | =ptrace(PT_STEP, pid)=               |
+
+*** The race window
+
+The Go runtime multiplexes goroutines (Gs) onto OS threads (Ms)
+([[https://go.dev/src/runtime/proc.go][runtime/proc.go]]). A multi-goroutine program typically has =GOMAXPROCS=
+OS threads ([[https://go.dev/doc/go1.5#runtime][defaults to NumCPU since Go 1.5]]). When we do a step-over,
+*all* of those threads resume during step 2:
+
+#+begin_example
+  Thread 1 (idle runtime M)     Thread 2 (hit BP)     Thread 3 (GC)
+  ==========================     =================     =============
+
+  1. RESTORE ORIGINAL BYTES AT 0x1000
+     Memory: [MOV X0,1] instead of [BRK #0]
+
+  2. PT_STEP(pid)  -- ALL THREADS RESUME
+     |                               |                    |
+     | running freely                | single-stepping    | running freely
+     | ...                           | executes MOV X0,1  | ...
+     | passes through 0x1000!        | SIGTRAP fires      | ...
+     | no BRK there -- sails past    |                    |
+     v                               v                    v
+
+  3. REINSTALL BRK AT 0x1000
+     Memory: [BRK #0]
+
+  Thread 1 already passed 0x1000. Breakpoint missed.
+#+end_example
+
+If Thread 1 happened to execute the same function (e.g. in a goroutine
+loop), it runs right through the unprotected address. The user sees the
+breakpoint "skipped".
+
+Why "skips 3 times then hits it"? Probabilistic. The step-over window
+is tiny (one instruction), but a hot loop with many goroutines will
+eventually have a thread pass through it. Sometimes you get lucky (the
+stepping thread completes before anyone else reaches 0x1000), sometimes
+you don't.
+
+*** Thread state during step-over (before fix)
+
+Which threads can hit 0x1000 during the step? All of them except the
+one being stepped.
+
+| Thread | Is stepping? | Mach-suspended? | Runs during PT_STEP? | Can miss BP? |
+|--------+--------------+-----------------+----------------------+--------------|
+| T1     | no           | no              | yes                  | yes          |
+| T2     | yes          | no              | yes (single-step)    | no           |
+| T3     | no           | no              | yes                  | yes          |
+|--------+--------------+-----------------+----------------------+--------------|
+| Unsafe |              |                 |                      |            2 |
+#+TBLFM: @5$5=vsum(@2$5..@4$5)
+
+*** The initial hypothesis: icache
+
+The reporter guessed "might be an icache problem." On ARM64 the I-cache
+and D-cache are separate ([[https://developer.arm.com/documentation/ddi0487/latest/][ARM ARM B2.4.4]]). Writing via the data path
+(=mach_vm_write=) doesn't automatically invalidate the I-cache.
+
+However, examining the C write helper:
+
+#+begin_src c
+/* mach_darwin_arm64.h: bingo_write_memory */
+static inline kern_return_t bingo_write_memory(
+    mach_port_t task, mach_vm_address_t addr,
+    const void *src, mach_vm_size_t n)
+{
+    task_suspend(task);         /* quiesce all threads */
+
+    /* ... mach_vm_protect + mach_vm_write ... */
+
+    task_resume(task);          /* flushes instruction pipeline */
+    return kr;
 }
+#+end_src
 
-func main() {
-	var waitGroup sync.WaitGroup
+On Apple Silicon, =mach_vm_machine_attribute(MATTR_VAL_ICACHE_FLUSH)= is
+a no-op (returns =KERN_NOT_SUPPORTED=). The correct mechanism is
+[[https://developer.apple.com/documentation/kernel/1537751-task_suspend][=task_suspend=]] / =task_resume=: the resume call drains the instruction
+pipeline for all threads, ensuring icache coherency. This was *already
+implemented*. Icache was a red herring.
 
-	for i := 0; i < 4; i++ {
-		waitGroup.Add(1)
+#+begin_example
+  Icache flush approaches on Apple Silicon:
 
-		go func(id int) {
-			defer waitGroup.Done()
+  mach_vm_machine_attribute(MATTR_VAL_ICACHE_FLUSH)
+    --> KERN_NOT_SUPPORTED  ✗
 
-			for j := 0; j < 100; j++ {
-				hotFunc(id)
-			}
-		}(i)
-	}
+  task_suspend(task) + mach_vm_write(...) + task_resume(task)
+    --> pipeline drain on resume  ✓  (already in our code)
+#+end_example
 
-	waitGroup.Wait()
+The =task_suspend= / =task_resume= here operates on independent
+[[https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/KernelProgramming/Mach/Mach.html][Mach suspend counts]], separate from ptrace. A ptrace-stopped thread stays
+stopped; the Mach suspend/resume is purely for pipeline flush.
+
+*** The fix: thread_suspend/thread_resume
+
+The solution is what every multi-threaded debugger does
+([[https://github.com/llvm/llvm-project/blob/main/lldb/source/Target/ThreadPlanStepOverBreakpoint.cpp][lldb's ThreadPlanStepOverBreakpoint]], [[https://github.com/go-delve/delve/blob/master/pkg/proc/native/proc_darwin.go][delve's Darwin backend]]):
+suspend all threads except the one being stepped, then resume them after
+reinstalling the trap.
+
+Darwin provides per-thread suspend/resume via Mach:
+
+#+begin_src c
+kern_return_t thread_suspend(mach_port_t thread);
+kern_return_t thread_resume(mach_port_t thread);
+#+end_src
+
+These operate on individual Mach thread ports (not PIDs). The suspend
+count is independent from ptrace and from =task_suspend=.
+
+*** Thread state during step-over (after fix)
+
+| Thread | Is stepping? | Mach-suspended? | Runs during PT_STEP? | Can miss BP? |
+|--------+--------------+-----------------+----------------------+--------------|
+| T1     | no           | yes             | no                   | no           |
+| T2     | yes          | no              | yes (single-step)    | no           |
+| T3     | no           | yes             | no                   | no           |
+|--------+--------------+-----------------+----------------------+--------------|
+| Unsafe |              |                 |                      |            0 |
+#+TBLFM: @5$5=vsum(@2$5..@4$5)
+
+#+begin_example
+  Thread 1 (idle)     Thread 2 (hit BP)     Thread 3 (GC)
+  ================     =================     =============
+
+  1. RESTORE ORIGINAL BYTES
+  2. thread_suspend(T1), thread_suspend(T3)     <-- NEW
+  3. PT_STEP(pid)
+     | SUSPENDED          | single-stepping    | SUSPENDED
+     | can't run           | executes MOV X0,1  | can't run
+     |                     | SIGTRAP fires      |
+  4. REINSTALL BRK
+  5. thread_resume(T1), thread_resume(T3)       <-- NEW
+  6. PT_CONTINUE(pid)
+     | running             | running            | running
+#+end_example
+
+No thread can pass through the unprotected address during step 3.
+
+*** Error path coverage
+
+Leaking a =thread_suspend= permanently freezes a thread. Every exit
+path from =resumeFromBreakpoint= / =handleStop= must resume:
+
+| Scenario               | BP reinstall? | Threads resumed? | Test                                        |
+|--------------------------+---------------+------------------+---------------------------------------------|
+| Normal step-over         | yes           | yes              | "suspends non-stepping threads during..."   |
+| WriteMemory fails        | no (error)    | yes              | "resumes suspended threads even if BP..."   |
+| Signal during step       | yes           | yes              | "resumes suspended threads when signal..."  |
+| SingleStep call fails    | skipped       | yes              | (error path in resumeFromBreakpoint)        |
+
+** Bug B: stale resume commands in the hub
+
+*** The architecture
+
+The system has three layers:
+
+#+begin_example
+  +--------+    WebSocket    +---------+    Go channels    +--------+
+  | Client | <============> |   Hub   | <===============> | Engine |
+  +--------+                +---------+                    +--------+
+                            (state machine)                (ptrace)
+#+end_example
+
+The hub has a *suspend loop*: when a breakpoint is hit, the engine emits
+=EventBreakpointHit=. The hub broadcasts it to clients, then enters a
+blocking select loop waiting for a *resuming command* (Continue, StepOver,
+etc.) on =resumeCh=:
+
+#+begin_src go
+resumeCh chan protocol.Command  /* capacity 1 */
+#+end_src
+
+Only capacity 1 ([[https://go.dev/ref/spec#Channel_types][Go spec: channel types]]). When a client sends Continue,
+=injectCommand= writes it:
+
+#+begin_src go
+func (h *Hub) injectCommand(_ *Client, cmd protocol.Command) {
+    if resumingCommands[cmd.Kind] {
+        select {
+        case h.resumeCh <- cmd:
+        default:
+            // Already has one -- silently dropped!
+        }
+        return
+    }
+    /* ... non-resuming commands go to cmdCh ... */
 }
-#+END_SRC
+#+end_src
 
-#+BEGIN_SRC bash :noweb yes
-set -euo pipefail
+*** The race
 
-cat <<'EOF' > bin.go
-<<bin>>
-EOF
+The problem: =resumeCh= has a buffer of 1. If a Continue arrives while
+the hub is *between* suspend loops (the process is running, no BP hit
+yet), the command sits in the buffer. When the next BP hit triggers a
+new suspend loop, the hub immediately reads the *stale* Continue and
+resumes -- before the client ever sees the breakpoint was hit.
 
-go build -gcflags='-N -l' -o bin bin.go
+*** Channel state truth table
 
-rm bin.go
+A buffered channel (cap 1) has three meaningful states. The behaviour of
+send and receive depends entirely on fullness
+([[https://go.dev/ref/spec#Send_statements][Go spec: send]], [[https://go.dev/ref/spec#Receive_operator][receive]]):
 
-echo "built: $(file bin)"
-#+END_SRC
+| resumeCh state | Hub state | Client sends Continue | Result              | User sees       |
+|----------------+-----------+-----------------------+---------------------+-----------------|
+| empty          | suspended | send                  | cmd delivered       | resumes (OK)    |
+| empty          | running   | send                  | cmd buffered (BAD)  | nothing yet     |
+| full (stale)   | suspended | (new BP hits)         | reads stale cmd     | BP skipped!     |
+| full (stale)   | suspended | send                  | dropped (default)   | nothing happens |
+| full (stale)   | running   | send                  | dropped (default)   | nothing happens |
 
-- [X] inspect binary output
+The two failure modes from the bug report map directly:
+- "skips breakpoint" = row 3 (stale cmd auto-resumes)
+- "nothing happens"  = row 4 or 5 (new cmd silently dropped)
 
-#+BEGIN_SRC bash
-  go build -tags bingonative -o ./build/bingo/bingo_server ./cmd/bingo
-  codesign --sign - --entitlements entitlements.plist --force ./build/bingo/bingo_server
-#+END_SRC
+#+begin_example
+  Time     Hub State          resumeCh       Client sees
+  ----     ---------          --------       -----------
+  t0       Suspended (BP#1)   []             "Breakpoint hit"
+  t1       Client sends Continue
+           Running            []             (OK)
+  t2       Client sends Continue again (accidental double-click, or
+           automation, or second client)
+           Running            [Continue]     --
+  t3       BP#2 fires
+           enters suspend loop
+           reads stale Continue from t2!
+           Running            []             NOTHING -- skipped!
+  t4       BP#3 fires
+           Suspended          []             "Breakpoint hit"
+#+end_example
 
+*** The fix: drain before entering suspend
 
-- [X] use debugger on go program
+#+begin_src go
+/* Before entering the suspend loop: */
+select {
+case <-h.resumeCh:
+    h.log.Debug("drained stale resume command from resumeCh")
+default:
+}
+#+end_src
 
-go tool objdump ./build/bingo/bingo_server | grep -A 20 'SingleStep'
+Simple non-blocking drain. Any command that was buffered while the process
+was running is discarded, because it cannot possibly be intended for the
+breakpoint that *just* fired (the client didn't even know about it yet).
 
-go tool objdump ./build/bingo/bingo_server | sed -n '606979,608256p' | grep -n 'CALL.*debugger\|CALL.*bingo' | head -30
+*** Channel state after fix
 
-- [X] reproduce issue
+| resumeCh state | Hub state | Client sends Continue | Drain | Result          | User sees    |
+|----------------+-----------+-----------------------+-------+-----------------+--------------|
+| empty          | suspended | send                  | noop  | cmd delivered   | resumes (OK) |
+| empty          | running   | send                  | --    | cmd buffered    | --           |
+| full (stale)   | suspended | (new BP hits)         | flush | waits for fresh | BP shown!    |
+| full (stale)   | suspended | send                  | flush | cmd delivered   | resumes (OK) |
+
+Row 3 is the fix: the drain discards the stale command, so the hub
+blocks until a *fresh* Continue arrives after the client has seen the BP.
+
+** Assumptions and caveats
+
+1. *We assumed the symptoms map to these two bugs.* The reporter's
+   description is consistent with both bugs, but there could be
+   additional issues that only manifest under specific thread scheduling
+   patterns or with specific target programs. Integration testing on a
+   real multi-threaded target is still needed.
+
+2. *We assumed =thread_suspend= is safe to call on ptrace-stopped threads.*
+   On Darwin, [[https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/KernelProgramming/Mach/Mach.html][Mach suspend counts]] and ptrace stops are independent state
+   machines. A thread can be both ptrace-stopped and Mach-suspended; it
+   needs both to be lifted before it runs. This is the same model
+   [[https://github.com/llvm/llvm-project/blob/main/lldb/source/Target/ThreadPlanStepOverBreakpoint.cpp][lldb uses]].
+   But if there's a kernel bug or undocumented interaction, this
+   assumption could break.
+
+3. *We assumed =task_suspend= / =task_resume= correctly flushes icache.*
+   Apple's documentation is sparse on this. The comment in the code cites
+   this as the correct approach on Apple Silicon. The alternative
+   (=mach_vm_machine_attribute= with =MATTR_VAL_ICACHE_FLUSH=) returns
+   =KERN_NOT_SUPPORTED= on Apple Silicon, confirming it's not the right API.
+
+4. *We assumed a single-producer drain is sufficient for Bug B.* A more
+   robust approach would use a generation counter (tag each command with
+   the suspend epoch it's intended for, reject mismatches). The drain
+   approach is simpler and correct for the current architecture where the
+   hub is the only consumer.
+
+5. *The "does not deadlock with many concurrent Kill calls" test is
+   pre-existing flaky.* It fails ~75% of the time on unmodified code.
+   This was not investigated or fixed -- it's a separate issue.
+
+6. *Linux =ptrace(PTRACE_SINGLESTEP, tid)= is per-thread* -- Bug A does
+   not apply there. The =SuspendThread= / =ResumeThread= stubs for Linux
+   are no-ops. If Linux ever gets a multi-thread step-over bug, it would
+   have a different root cause.
+
+** Suspend count interactions
+
+Three independent mechanisms can stop a thread on Darwin. A thread runs
+only when *all three* allow it:
+
+| Mechanism           | Scope    | API                        | Our use                 |
+|---------------------+----------+----------------------------+-------------------------|
+| ptrace stop         | process  | =PT_STEP= / =PT_CONTINUE= | debugger control flow    |
+| Mach task suspend   | process  | =task_suspend= / =resume=  | icache flush (memory W) |
+| Mach thread suspend | thread   | =thread_suspend= / =resume= | step-over guard (NEW)   |
+
+#+begin_example
+  Can a thread run?
+
+  ptrace-stopped?     N ──> STOPPED
+       |
+       Y (running)
+       |
+  task-suspended?     Y ──> STOPPED
+       |
+       N
+       |
+  thread-suspended?   Y ──> STOPPED
+       |
+       N
+       |
+       v
+     RUNNING
+#+end_example
+
+Engine calls [[https://pkg.go.dev/runtime#LockOSThread][=runtime.LockOSThread=]] to pin the ptrace-calling goroutine
+to a single OS thread, since ptrace requires same-thread affinity
+(strictly required on Linux, done for consistency on Darwin). System
+calls go through [[https://pkg.go.dev/syscall#RawSyscall][=syscall.RawSyscall=]] which does not inform the Go
+scheduler — correct for ptrace since we don't want preemption mid-call.

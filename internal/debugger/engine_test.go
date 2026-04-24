@@ -3,6 +3,8 @@ package debugger_test
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -44,6 +46,15 @@ type fakeBackend struct {
 	continueCalls   int
 	singleStepCalls []int
 	writtenAt       map[uint64][]byte // addr → last bytes written
+
+	// Thread suspend/resume tracking for step-over tests.
+	threadMu         sync.Mutex
+	suspendedThreads []int
+	resumedThreads   []int
+
+	// writeMemoryErr, when non-nil, is returned by the next WriteMemory call
+	// (then cleared). Used to simulate reinstall failures.
+	writeMemoryErr error
 }
 
 func newFakeBackend() *fakeBackend {
@@ -106,6 +117,11 @@ func (f *fakeBackend) ReadMemory(addr uint64, dst []byte) error {
 }
 
 func (f *fakeBackend) WriteMemory(addr uint64, src []byte) error {
+	if f.writeMemoryErr != nil {
+		err := f.writeMemoryErr
+		f.writeMemoryErr = nil
+		return err
+	}
 	cp := make([]byte, len(src))
 	copy(cp, src)
 	f.writtenAt[addr] = cp
@@ -113,6 +129,36 @@ func (f *fakeBackend) WriteMemory(addr uint64, src []byte) error {
 		f.mem[addr+uint64(i)] = b
 	}
 	return nil
+}
+
+func (f *fakeBackend) SuspendThread(tid int) error {
+	f.threadMu.Lock()
+	f.suspendedThreads = append(f.suspendedThreads, tid)
+	f.threadMu.Unlock()
+	return nil
+}
+
+func (f *fakeBackend) ResumeThread(tid int) error {
+	f.threadMu.Lock()
+	f.resumedThreads = append(f.resumedThreads, tid)
+	f.threadMu.Unlock()
+	return nil
+}
+
+func (f *fakeBackend) getSuspendedThreads() []int {
+	f.threadMu.Lock()
+	defer f.threadMu.Unlock()
+	cp := make([]int, len(f.suspendedThreads))
+	copy(cp, f.suspendedThreads)
+	return cp
+}
+
+func (f *fakeBackend) getResumedThreads() []int {
+	f.threadMu.Lock()
+	defer f.threadMu.Unlock()
+	cp := make([]int, len(f.resumedThreads))
+	copy(cp, f.resumedThreads)
+	return cp
 }
 
 func (f *fakeBackend) GetRegisters(tid int) (debugger.Registers, error) {
@@ -784,6 +830,153 @@ var _ = Describe("Engine", func() {
 		It("returns no event when the engine is idle", func() {
 			_, ok := nextEvent(d)
 			Expect(ok).To(BeFalse())
+		})
+	})
+
+	// ── step-over thread safety (Bug A) ──────────────────────────────────
+
+	Describe("step-over thread safety", func() {
+		const bpAddr = uint64(0x6000)
+
+		BeforeEach(func() {
+			// Multi-threaded setup: 3 threads.
+			fb.tids = []int{1, 2, 3}
+			fb.regs[1] = debugger.Registers{PC: 0x1000}
+			fb.regs[2] = debugger.Registers{PC: bpAddr}
+			fb.regs[3] = debugger.Registers{PC: 0x3000}
+			fb.seedMem(bpAddr, []byte{0x90}) // original byte
+			debugger.ExportedForceSuspended(d)
+			debugger.ExportedSetBreakpointAt(d, bpAddr)
+		})
+
+		It("suspends non-stepping threads during BP step-over", func() {
+			// Continue to hit the breakpoint on thread 2.
+			Expect(d.Continue()).To(Succeed())
+			fb.pushStop(debugger.StopEvent{
+				Reason: debugger.StopBreakpoint,
+				TID:    2,
+				PC:     bpAddr,
+			})
+			evt := mustNextEvent(d)
+			Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit))
+
+			// Continue again — triggers resumeFromBreakpoint.
+			// The engine must suspend threads 1 and 3 before single-stepping thread 2.
+			Expect(d.Continue()).To(Succeed())
+			Expect(fb.getSuspendedThreads()).To(ConsistOf(1, 3),
+				"threads 1 and 3 should be suspended during step-over")
+			Expect(fb.singleStepCalls).To(ConsistOf(2),
+				"SingleStep should be called on the BP-hitting thread (2)")
+
+			// Complete the single-step.
+			fb.pushStop(debugger.StopEvent{
+				Reason: debugger.StopSingleStep,
+				TID:    2,
+				PC:     bpAddr + 4,
+			})
+			// The engine should resume the suspended threads after reinstalling BP.
+			// It then calls ContinueProcess and starts waitLoop, which will emit
+			// an event when the next stop arrives. We just need to verify the
+			// suspended threads were resumed.
+			//
+			// Give the engine time to process the StopSingleStep in its loop.
+			Eventually(func() []int {
+				return fb.getResumedThreads()
+			}, eventTimeout).Should(ConsistOf(1, 3),
+				"threads 1 and 3 should be resumed after step-over completes")
+		})
+
+		It("resumes suspended threads even if BP reinstall fails", func() {
+			// Hit breakpoint on thread 2.
+			Expect(d.Continue()).To(Succeed())
+			fb.pushStop(debugger.StopEvent{
+				Reason: debugger.StopBreakpoint,
+				TID:    2,
+				PC:     bpAddr,
+			})
+			mustNextEvent(d)
+
+			// Continue — triggers step-over. The first WriteMemory (restore
+			// original bytes) succeeds, but the second (reinstall trap after
+			// step) will fail.
+			Expect(d.Continue()).To(Succeed())
+
+			// Arm the write failure for the reinstall.
+			fb.writeMemoryErr = fmt.Errorf("simulated reinstall failure")
+
+			fb.pushStop(debugger.StopEvent{
+				Reason: debugger.StopSingleStep,
+				TID:    2,
+				PC:     bpAddr + 4,
+			})
+
+			// Even though reinstall failed, suspended threads must be resumed.
+			Eventually(func() []int {
+				return fb.getResumedThreads()
+			}, eventTimeout).Should(ConsistOf(1, 3),
+				"suspended threads must be resumed even on reinstall failure")
+		})
+
+		It("resumes suspended threads when signal arrives during step-over", func() {
+			// Hit breakpoint on thread 2.
+			Expect(d.Continue()).To(Succeed())
+			fb.pushStop(debugger.StopEvent{
+				Reason: debugger.StopBreakpoint,
+				TID:    2,
+				PC:     bpAddr,
+			})
+			mustNextEvent(d)
+
+			// Continue — triggers step-over.
+			Expect(d.Continue()).To(Succeed())
+
+			// Instead of StopSingleStep, a signal arrives during the step.
+			fb.pushStop(debugger.StopEvent{
+				Reason: debugger.StopSignal,
+				TID:    2,
+				PC:     bpAddr + 2,
+				Signal: 11, // SIGSEGV
+			})
+
+			// Suspended threads must be resumed after signal handling.
+			Eventually(func() []int {
+				return fb.getResumedThreads()
+			}, eventTimeout).Should(ConsistOf(1, 3),
+				"suspended threads must be resumed after signal during step-over")
+		})
+
+		It("full cycle: BP hit → step-over → BP hit again", func() {
+			// First BP hit on thread 2.
+			Expect(d.Continue()).To(Succeed())
+			fb.pushStop(debugger.StopEvent{
+				Reason: debugger.StopBreakpoint,
+				TID:    2,
+				PC:     bpAddr,
+			})
+			evt := mustNextEvent(d)
+			Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit))
+
+			// Continue (step-over).
+			Expect(d.Continue()).To(Succeed())
+			fb.pushStop(debugger.StopEvent{
+				Reason: debugger.StopSingleStep,
+				TID:    2,
+				PC:     bpAddr + 4,
+			})
+
+			// After step-over completes, the engine reinstalls the trap and
+			// calls ContinueProcess. Push the second BP hit immediately —
+			// the engine loop will process it after the step-over is done.
+			// Waiting for the BreakpointHit event naturally synchronizes
+			// with the engine loop (no racy polling needed).
+			fb.pushStop(debugger.StopEvent{
+				Reason: debugger.StopBreakpoint,
+				TID:    2,
+				PC:     bpAddr,
+			})
+			evt = mustNextEvent(d)
+			Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit),
+				"second BP hit should be reported after step-over cycle")
 		})
 	})
 })

@@ -381,6 +381,22 @@ func (b *darwinBackend) Wait() (StopEvent, error) {
 	}
 }
 
+func (b *darwinBackend) SuspendThread(tid int) error {
+	kr := C.thread_suspend(C.mach_port_t(tid))
+	if kr != C.KERN_SUCCESS {
+		return fmt.Errorf("thread_suspend tid %d: %s", tid, machErrString(kr))
+	}
+	return nil
+}
+
+func (b *darwinBackend) ResumeThread(tid int) error {
+	kr := C.thread_resume(C.mach_port_t(tid))
+	if kr != C.KERN_SUCCESS {
+		return fmt.Errorf("thread_resume tid %d: %s", tid, machErrString(kr))
+	}
+	return nil
+}
+
 func (b *darwinBackend) setPID(pid int) { b.pid = pid }
 
 // TextSlide returns the ASLR slide for the main executable: the difference

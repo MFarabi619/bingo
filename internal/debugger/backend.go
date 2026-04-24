@@ -34,6 +34,15 @@ type Backend interface {
 	// Wait blocks until the tracee produces a debug stop.
 	// Must return ErrProcessExited when the tracee has exited.
 	Wait() (StopEvent, error)
+
+	// SuspendThread suspends a single thread so it does not execute while
+	// other threads are being single-stepped. Used during the breakpoint
+	// step-over window to prevent non-stepping threads from running past
+	// an unprotected breakpoint address.
+	SuspendThread(tid int) error
+
+	// ResumeThread resumes a previously suspended thread.
+	ResumeThread(tid int) error
 }
 
 // ── pidSetter ─────────────────────────────────────────────────────────────────

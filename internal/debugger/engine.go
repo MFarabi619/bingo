@@ -95,6 +95,11 @@ type engine struct {
 	// Consumed (zeroed) on each sourceStepOver call and on user-BP hits.
 	stepOverFile string
 	stepOverLine int
+
+	// suspendedTIDs holds the thread IDs suspended during a breakpoint
+	// step-over. They are resumed after the trap is reinstalled (or on
+	// error / signal) so no thread can run past the unprotected address.
+	suspendedTIDs []int
 }
 
 type engineCmd struct {
@@ -464,11 +469,15 @@ func (e *engine) handleStop(stop StopEvent) {
 				// Suspend and report the error so the client knows what happened.
 				slog.Error("breakpoint reinstall failed — suspending to prevent runaway process",
 					"addr", fmt.Sprintf("0x%x", sob.addr), "err", rerr)
+				e.resumeSuspendedThreads()
 				e.setState(stateSuspended)
 				e.emitError(protocol.CmdNone, fmt.Errorf("reinstall breakpoint 0x%x: %w", sob.addr, rerr))
 				return
 			}
 			slog.Debug("breakpoint reinstalled", "addr", fmt.Sprintf("0x%x", sob.addr))
+			// Step-over complete: resume the threads we suspended before the
+			// single-step so they can run again.
+			e.resumeSuspendedThreads()
 			switch e.bpResume {
 			case bpResumeContinue:
 				_ = e.backend.ContinueProcess()
@@ -535,10 +544,12 @@ func (e *engine) handleStop(stop StopEvent) {
 		if sob := e.steppingOverBP; sob != nil {
 			e.steppingOverBP = nil
 			if rerr := e.bps.reinstall(e.backend, sob); rerr != nil {
+				e.resumeSuspendedThreads()
 				e.setState(stateSuspended)
 				e.emitError(protocol.CmdNone, fmt.Errorf("reinstall breakpoint 0x%x after signal: %w", sob.addr, rerr))
 				return
 			}
+			e.resumeSuspendedThreads()
 		}
 		e.emitOutput("stderr", fmt.Sprintf("signal %d", stop.Signal))
 		_ = e.backend.ContinueProcess()
@@ -693,16 +704,47 @@ func (e *engine) resumeFromBreakpoint(action bpResumeAction, retAddr uint64) err
 		}
 		tid = threads[0]
 	}
+
+	// Suspend every thread except the one being stepped. On Darwin,
+	// PT_STEP resumes all threads — without this, other threads run past
+	// the unprotected breakpoint address during the step-over window.
+	threads, err := e.backend.Threads()
+	if err == nil {
+		for _, t := range threads {
+			if t == tid {
+				continue
+			}
+			if serr := e.backend.SuspendThread(t); serr != nil {
+				slog.Warn("SuspendThread failed", "tid", t, "err", serr)
+			} else {
+				e.suspendedTIDs = append(e.suspendedTIDs, t)
+			}
+		}
+	}
+
 	e.lastBPTID = 0
 	if err := e.backend.SingleStep(tid); err != nil {
 		_ = e.backend.WriteMemory(bp.addr, archTrapInstruction())
 		e.bps.addToTable(bp)
 		e.steppingOverBP = nil
+		e.resumeSuspendedThreads()
 		return fmt.Errorf("resume BP: single step: %w", err)
 	}
 	e.setState(stateRunning)
 	go e.waitLoop()
 	return nil
+}
+
+// resumeSuspendedThreads resumes all threads that were suspended during a
+// breakpoint step-over and clears the list. Errors are logged but not returned
+// — a leaked thread_suspend is bad but should not block the debugger.
+func (e *engine) resumeSuspendedThreads() {
+	for _, tid := range e.suspendedTIDs {
+		if err := e.backend.ResumeThread(tid); err != nil {
+			slog.Warn("ResumeThread failed", "tid", tid, "err", err)
+		}
+	}
+	e.suspendedTIDs = nil
 }
 
 // ── Stack walking ─────────────────────────────────────────────────────────────

@@ -304,6 +304,9 @@ func (b *darwinBackend) Wait() (StopEvent, error) {
 
 func (b *darwinBackend) setPID(pid int) { b.pid = pid }
 
+func (b *darwinBackend) SuspendThread(tid int) error { return nil }
+func (b *darwinBackend) ResumeThread(tid int) error  { return nil }
+
 var _ Backend = (*darwinBackend)(nil)
 
 // ── Little-endian helpers ─────────────────────────────────────────────────────

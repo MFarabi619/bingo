@@ -409,6 +409,9 @@ func readPtr(b []byte, off int) uintptr {
 	return uintptr(uint32(p[0]) | uint32(p[1])<<8 | uint32(p[2])<<16 | uint32(p[3])<<24)
 }
 
+func (b *windowsBackend) SuspendThread(tid int) error { return nil }
+func (b *windowsBackend) ResumeThread(tid int) error  { return nil }
+
 var _ Backend = (*windowsBackend)(nil)
 
 func (b *windowsBackend) setPID(pid int) { b.pid = uint32(pid) }

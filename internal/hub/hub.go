@@ -259,6 +259,17 @@ func (h *Hub) handleEvent(ctx context.Context, evt protocol.Event) {
 		return
 	}
 
+	// Drain any stale resume command that was buffered while the process
+	// was running (between the previous suspend loop exit and this entry).
+	// Without this drain, a Continue sent during the running phase would
+	// be read immediately and auto-resume the new breakpoint hit before
+	// the client ever sees it.
+	select {
+	case <-h.resumeCh:
+		h.log.Debug("drained stale resume command from resumeCh")
+	default:
+	}
+
 	h.log.Info("suspended — waiting for resuming command", "event", evt.Kind)
 
 	timeout := time.NewTimer(30 * time.Minute)

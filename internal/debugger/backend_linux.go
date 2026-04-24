@@ -281,6 +281,9 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 	}
 }
 
+func (b *linuxBackend) SuspendThread(tid int) error { return nil }
+func (b *linuxBackend) ResumeThread(tid int) error  { return nil }
+
 var _ Backend = (*linuxBackend)(nil)
 
 func (b *linuxBackend) setPID(pid int) { b.pid = pid }

@@ -639,4 +639,53 @@ var _ = Describe("Hub", func() {
 			}, "500ms", "10ms").Should(Equal(protocol.EventError))
 		})
 	})
+
+	// ── stale resume prevention (Bug B) ──────────────────────────────────
+
+	Describe("stale resume prevention", func() {
+		It("does not auto-resume from a stale Continue buffered before the next BP hit", func() {
+			conn := newFakeWSConn()
+			h.AddClient(conn, nil)
+
+			// 1. Suspend via first BreakpointHit.
+			fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
+				protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
+			e, ok := recvEvent(conn)
+			Expect(ok).To(BeTrue())
+			Expect(e.Kind).To(Equal(protocol.EventBreakpointHit))
+
+			// 2. Resume with Continue.
+			conn.inject(mustCommand(protocol.CmdContinue, struct{}{}))
+			Eventually(fd.recordedCalls, "500ms", "10ms").
+				Should(ContainElement("Continue"))
+
+			// 3. Now inject a STALE Continue before the next BP hit arrives.
+			//    This simulates a client sending Continue while the hub is
+			//    between suspend loops (process is running).
+			conn.inject(mustCommand(protocol.CmdContinue, struct{}{}))
+			time.Sleep(50 * time.Millisecond) // let it land in resumeCh
+
+			// 4. Second BreakpointHit arrives.
+			fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 2,
+				protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
+
+			// 5. Client should see the second BreakpointHit and the hub
+			//    should remain suspended — NOT auto-resumed by the stale Continue.
+			e, ok = recvEvent(conn)
+			Expect(ok).To(BeTrue())
+			Expect(e.Kind).To(Equal(protocol.EventBreakpointHit),
+				"second BP hit should be delivered to client")
+
+			// 6. Verify Continue was NOT called again (only the first one).
+			time.Sleep(100 * time.Millisecond) // give hub time to incorrectly auto-resume
+			continueCount := 0
+			for _, c := range fd.recordedCalls() {
+				if c == "Continue" {
+					continueCount++
+				}
+			}
+			Expect(continueCount).To(Equal(1),
+				"Continue should be called exactly once — stale command must not auto-resume")
+		})
+	})
 })
